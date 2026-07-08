@@ -1,7 +1,11 @@
 import { QpackDecoder, QpackError, type HeaderField } from '../src/index.js';
 import { qit, withTimeout } from './harness/disabled.js';
 import { loadCorpusManifest, readCorpusFile } from './harness/corpus.js';
-import { readInteropBlocks, ENCODER_STREAM_ID } from './harness/framing.js';
+import {
+    readInteropBlocks,
+    impliedCapacityInstruction,
+    ENCODER_STREAM_ID
+} from './harness/framing.js';
 
 const manifest = await loadCorpusManifest();
 
@@ -23,6 +27,7 @@ describe('error corpus', () => {
                 maxTableCapacity: 4096,
                 maxBlockedStreams: 100
             });
+            decoder.processEncoderStreamData(impliedCapacityInstruction(4096));
 
             try {
                 const decodes: Array<Promise<HeaderField[]>> = [];

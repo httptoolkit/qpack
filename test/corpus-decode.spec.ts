@@ -3,7 +3,11 @@ import { expect } from 'chai';
 import { QpackDecoder, type HeaderField } from '../src/index.js';
 import { qit, withTimeout } from './harness/disabled.js';
 import { loadCorpusManifest, readCorpusFile, readReferenceDecoding } from './harness/corpus.js';
-import { readInteropBlocks, ENCODER_STREAM_ID } from './harness/framing.js';
+import {
+    readInteropBlocks,
+    impliedCapacityInstruction,
+    ENCODER_STREAM_ID
+} from './harness/framing.js';
 import { sortedBlockEntries } from './harness/utils.js';
 
 const manifest = await loadCorpusManifest();
@@ -26,6 +30,9 @@ describe('corpus decode', () => {
                 maxTableCapacity: corpusCase.tableSize,
                 maxBlockedStreams: corpusCase.maxBlocked
             });
+            decoder.processEncoderStreamData(
+                impliedCapacityInstruction(corpusCase.tableSize)
+            );
 
             // Process blocks strictly in file order. Field sections may be
             // received before the insertions they reference (that's how the

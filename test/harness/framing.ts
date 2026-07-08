@@ -8,6 +8,30 @@
 
 export const ENCODER_STREAM_ID = 0;
 
+/**
+ * In the offline interop format the dynamic table capacity is agreed
+ * out-of-band (the encoder's table size parameter, from the filename), and
+ * encoders may use the table without sending any Set Dynamic Table Capacity
+ * instruction, unlike in real HTTP/3 where the capacity starts at 0 (RFC
+ * 9204 s3.2.3). ls-qpack's interop-decode initializes its table accordingly,
+ * and so must we: this builds the equivalent explicit instruction to feed to
+ * the decoder before any interop-format data. (Files that do contain their
+ * own capacity instructions just adjust downwards from this, harmlessly.)
+ */
+export function impliedCapacityInstruction(tableSize: number): Uint8Array {
+    // Set Dynamic Table Capacity: '001' then the capacity in a 5-bit prefix
+    if (tableSize < 31) return Uint8Array.from([0x20 | tableSize]);
+
+    const bytes = [0x3f];
+    let remainder = tableSize - 31;
+    while (remainder >= 128) {
+        bytes.push((remainder % 128) | 0x80);
+        remainder = Math.floor(remainder / 128);
+    }
+    bytes.push(remainder);
+    return Uint8Array.from(bytes);
+}
+
 export interface InteropBlock {
     streamId: number;
     data: Uint8Array;

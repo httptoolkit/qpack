@@ -4,7 +4,11 @@ import { QpackDecoder, type HeaderField } from '../src/index.js';
 import { qit, withTimeout } from './harness/disabled.js';
 import { QIF_NAMES, readQif } from './harness/corpus.js';
 import { parseQif } from './harness/qif.js';
-import { readInteropBlocks, ENCODER_STREAM_ID } from './harness/framing.js';
+import {
+    readInteropBlocks,
+    impliedCapacityInstruction,
+    ENCODER_STREAM_ID
+} from './harness/framing.js';
 import { lsqpackEncode, type InteropEncodeSettings } from './harness/lsqpack.js';
 import { sortedBlockEntries } from './harness/utils.js';
 
@@ -36,6 +40,9 @@ describe('decode cross-check', function () {
             maxTableCapacity: settings.tableSize,
             maxBlockedStreams: settings.maxBlocked
         });
+        decoder.processEncoderStreamData(
+            impliedCapacityInstruction(settings.tableSize)
+        );
 
         const decodes: Array<Promise<[number, HeaderField[]]>> = [];
         for (const block of interopBlocks) {

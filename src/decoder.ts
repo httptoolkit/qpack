@@ -3,6 +3,7 @@ import { QpackError } from './errors.js';
 import { encodePrefixedInt, decodePrefixedInt, type DecodedInt } from './prefixed-int.js';
 import { decodeStringLiteral, concatBytes, type DecodedString } from './strings.js';
 import { STATIC_TABLE } from './static-table.js';
+import { DynamicTable, entrySize } from './dynamic-table.js';
 
 export interface QpackDecoderOptions {
     /**
@@ -14,20 +15,33 @@ export interface QpackDecoderOptions {
 
     /**
      * Our advertised SETTINGS_QPACK_BLOCKED_STREAMS: the maximum number of
-     * field sections that may be blocked waiting for dynamic table
+     * streams whose field sections may be blocked waiting for dynamic table
      * insertions at any one time. Defaults to 0.
      */
     maxBlockedStreams?: number;
+}
+
+interface BlockedSection {
+    streamId: number;
+    data: Uint8Array;
+    requiredInsertCount: DecodedInt;
+    resolve: (headers: HeaderField[]) => void;
+    reject: (error: Error) => void;
 }
 
 export class QpackDecoder {
     private readonly maxTableCapacity: number;
     private readonly maxBlockedStreams: number;
 
-    /** The current dynamic table capacity, as set by the peer's encoder */
-    private tableCapacity = 0;
-    /** The total number of dynamic table insertions ever made */
-    private insertCount = 0;
+    private readonly table = new DynamicTable();
+    private blockedSections: BlockedSection[] = [];
+
+    /**
+     * Our best lower bound on the peer's Known Received Count, from the
+     * Insert Count Increments and Section Acknowledgments we've emitted.
+     * Used to size increments so the peer's count never overruns.
+     */
+    private peerKnownInsertCount = 0;
 
     private encoderStreamBuffer = new Uint8Array(0);
     private pendingDecoderStreamData: Uint8Array[] = [];
@@ -69,6 +83,19 @@ export class QpackDecoder {
         // Retain any incomplete trailing instruction (copied, as `data` may
         // be reused by the caller):
         this.encoderStreamBuffer = buffer.slice(offset);
+
+        if (this.table.insertCount > this.peerKnownInsertCount) {
+            // Insert Count Increment. Emitting this eagerly for every batch
+            // of insertions is a policy choice (RFC 9204 s4.4.3 leaves the
+            // timing open): it keeps the encoder's view current even when
+            // nothing referencing the entries is decoded.
+            this.pendingDecoderStreamData.push(encodePrefixedInt(
+                this.table.insertCount - this.peerKnownInsertCount, 6, 0x00
+            ));
+            this.peerKnownInsertCount = this.table.insertCount;
+
+            this.unblockReadySections();
+        }
     }
 
     /**
@@ -78,18 +105,61 @@ export class QpackDecoder {
     private processEncoderInstruction(data: Uint8Array, offset: number): number | null {
         const firstByte = data[offset]!;
 
-        if (firstByte & 0x80) { // Insert with name reference
-            throw new Error('qpack: not yet implemented (dynamic table insertion)');
-        } else if (firstByte & 0x40) { // Insert with literal name
-            throw new Error('qpack: not yet implemented (dynamic table insertion)');
+        if (firstByte & 0x80) { // Insert with name reference (T=0x40: static)
+            const nameIndex = decodePrefixedInt(data, offset, 6);
+            if (nameIndex === null) return null;
+            const value = decodeStringLiteral(data, nameIndex.end, 7);
+            if (value === null) return null;
+
+            const name = (firstByte & 0x40)
+                ? this.staticEntry(nameIndex.value).name
+                : this.insertedEntry(nameIndex.value).name;
+            this.insertEntry({ name, value: value.value });
+            return value.end;
+        } else if (firstByte & 0x40) { // Insert with literal name (H=0x20)
+            const name = decodeStringLiteral(data, offset, 5);
+            if (name === null) return null;
+            const value = decodeStringLiteral(data, name.end, 7);
+            if (value === null) return null;
+
+            this.insertEntry({ name: name.value, value: value.value });
+            return value.end;
         } else if (firstByte & 0x20) { // Set dynamic table capacity
             const capacity = decodePrefixedInt(data, offset, 5);
             if (capacity === null) return null;
             this.setTableCapacity(capacity.value);
             return capacity.end;
         } else { // Duplicate
-            throw new Error('qpack: not yet implemented (duplicate)');
+            const index = decodePrefixedInt(data, offset, 5);
+            if (index === null) return null;
+            this.insertEntry(this.insertedEntry(index.value));
+            return index.end;
         }
+    }
+
+    /** Looks up an insert instruction's reference, relative to the insert count */
+    private insertedEntry(relativeIndex: number): HeaderField {
+        const absoluteIndex = this.table.insertCount - relativeIndex - 1;
+        const entry = this.table.get(absoluteIndex);
+        if (!entry) {
+            throw new QpackError(
+                'QPACK_ENCODER_STREAM_ERROR',
+                `Insertion references a missing dynamic table entry ` +
+                `(absolute index ${absoluteIndex})`
+            );
+        }
+        return entry;
+    }
+
+    private insertEntry(field: HeaderField): void {
+        if (!this.table.canFit(entrySize(field))) {
+            throw new QpackError(
+                'QPACK_ENCODER_STREAM_ERROR',
+                `Cannot insert an entry of size ${entrySize(field)} into a dynamic ` +
+                `table with capacity ${this.table.capacity}`
+            );
+        }
+        this.table.insert(field);
     }
 
     private setTableCapacity(capacity: number): void {
@@ -100,7 +170,7 @@ export class QpackDecoder {
                 `${this.maxTableCapacity}`
             );
         }
-        this.tableCapacity = capacity;
+        this.table.setCapacity(capacity);
     }
 
     /**
@@ -112,10 +182,56 @@ export class QpackDecoder {
     async decodeFieldSection(streamId: number, data: Uint8Array): Promise<HeaderField[]> {
         const requiredInsertCount = this.decodeRequiredInsertCount(data);
 
-        if (requiredInsertCount.value > this.insertCount) {
-            throw new Error('qpack: not yet implemented (blocked field sections)');
+        if (requiredInsertCount.value <= this.table.insertCount) {
+            return this.decodeSectionNow(streamId, data, requiredInsertCount);
         }
 
+        // Blocked: wait for the required insertions to arrive.
+        const blockedStreams = new Set(this.blockedSections.map((s) => s.streamId));
+        blockedStreams.add(streamId);
+        if (blockedStreams.size > this.maxBlockedStreams) {
+            throw new QpackError(
+                'QPACK_DECOMPRESSION_FAILED',
+                `Too many blocked streams (limit ${this.maxBlockedStreams})`
+            );
+        }
+
+        return new Promise<HeaderField[]>((resolve, reject) => {
+            this.blockedSections.push({
+                streamId,
+                data: data.slice(), // Copied, as the caller may reuse the buffer
+                requiredInsertCount,
+                resolve,
+                reject
+            });
+        });
+    }
+
+    private unblockReadySections(): void {
+        const stillBlocked: BlockedSection[] = [];
+        for (const section of this.blockedSections) {
+            if (section.requiredInsertCount.value > this.table.insertCount) {
+                stillBlocked.push(section);
+                continue;
+            }
+            try {
+                section.resolve(this.decodeSectionNow(
+                    section.streamId,
+                    section.data,
+                    section.requiredInsertCount
+                ));
+            } catch (error) {
+                section.reject(error as Error);
+            }
+        }
+        this.blockedSections = stillBlocked;
+    }
+
+    private decodeSectionNow(
+        streamId: number,
+        data: Uint8Array,
+        requiredInsertCount: DecodedInt
+    ): HeaderField[] {
         const base = this.decodeBase(data, requiredInsertCount);
         const headers = this.parseFieldLines(
             data,
@@ -125,8 +241,14 @@ export class QpackDecoder {
         );
 
         if (requiredInsertCount.value > 0) {
-            // Section Acknowledgment (required by RFC 9204 s4.4.1):
+            // Section Acknowledgment (required by RFC 9204 s4.4.1). This also
+            // tells the peer about every insertion up to this section's
+            // Required Insert Count:
             this.pendingDecoderStreamData.push(encodePrefixedInt(streamId, 7, 0x80));
+            this.peerKnownInsertCount = Math.max(
+                this.peerKnownInsertCount,
+                requiredInsertCount.value
+            );
         }
 
         return headers;
@@ -145,7 +267,7 @@ export class QpackDecoder {
             );
         }
 
-        const maxValue = this.insertCount + this.maxEntries;
+        const maxValue = this.table.insertCount + this.maxEntries;
         const maxWrapped = Math.floor(maxValue / fullRange) * fullRange;
         let value = maxWrapped + encoded.value - 1;
 
@@ -259,7 +381,15 @@ export class QpackDecoder {
                 `Required Insert Count (${requiredInsertCount})`
             );
         }
-        throw new Error('qpack: not yet implemented (dynamic table)');
+        const entry = this.table.get(absoluteIndex);
+        if (!entry) {
+            throw new QpackError(
+                'QPACK_DECOMPRESSION_FAILED',
+                `Dynamic table reference to an evicted entry (absolute index ` +
+                `${absoluteIndex})`
+            );
+        }
+        return entry;
     }
 
     /** Rejects incomplete data: within a field section this means truncation */
@@ -275,6 +405,12 @@ export class QpackDecoder {
      * is abandoned and a Stream Cancellation can be emitted.
      */
     cancelStream(streamId: number): void {
+        const cancelled = this.blockedSections.filter((s) => s.streamId === streamId);
+        this.blockedSections = this.blockedSections.filter((s) => s.streamId !== streamId);
+        for (const section of cancelled) {
+            section.reject(new Error(`Stream ${streamId} cancelled while blocked`));
+        }
+
         // With a zero-capacity dynamic table no state can be affected, so we
         // omit cancellations entirely (permitted by RFC 9204 s2.2.2.2):
         if (this.maxTableCapacity === 0) return;

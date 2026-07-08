@@ -162,7 +162,7 @@ describe('RFC 9204 appendix B', () => {
         expect(headers).to.deep.equal([
             { name: 'custom-key', value: 'custom-value2' }
         ]);
-        expect(decoder.takeDecoderStreamData()).to.deep.equal(hex('4c')); // Ack, stream 12
+        expect(decoder.takeDecoderStreamData()).to.deep.equal(hex('8c')); // Ack, stream 12
     });
 
     qit('B.5 references to evicted entries are rejected', async () => {
