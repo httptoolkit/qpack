@@ -9,10 +9,6 @@ export const DISABLED_TESTS = [
     // works at all (see harness.spec.ts). Everything below should go.
     'test harness disabled test handling expected-failure canary',
 
-    // Stage 2: integer & string primitives
-    'prefixed integers *',
-    'huffman coding *',
-
     // Stage 3: static table, and encoding/decoding with the dynamic table
     // disabled (capacity 0)
     'static table *',
