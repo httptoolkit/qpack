@@ -10,6 +10,7 @@ import * as path from 'node:path';
 
 import { parseQif, decodedBlocksInStreamOrder, serializeQif } from '../test/harness/qif.js';
 import { lsqpackDecode, TOOLS_DIR, QIFS_DIR, CORPUS_MANIFEST_PATH } from '../test/harness/lsqpack.js';
+import { nghttp3Decode } from '../test/harness/nghttp3.js';
 import type { CorpusCase, CorpusManifest, ErrorCase } from '../test/harness/corpus.js';
 
 const ENCODED_DIR = 'encoded/qpack-06';
@@ -55,6 +56,7 @@ async function buildCase(encodedPath: string): Promise<CorpusCase> {
         ackMode,
         qifPath,
         referenceOk: false,
+        nghttp3Ok: false,
         decodedPath: null
     };
 
@@ -78,6 +80,18 @@ async function buildCase(encodedPath: string): Promise<CorpusCase> {
     ).join('\n');
     await fs.writeFile(outputFile, output);
     corpusCase.decodedPath = decodedPath;
+
+    // Second, independent validation of the same file with nghttp3:
+    try {
+        const nghttp3Blocks = await nghttp3Decode(encoded, { tableSize, maxBlocked });
+        if (JSON.stringify(nghttp3Blocks) === JSON.stringify(decodedBlocks)) {
+            corpusCase.nghttp3Ok = true;
+        } else {
+            corpusCase.nghttp3Note = 'nghttp3 decoding does not match';
+        }
+    } catch (error) {
+        corpusCase.nghttp3Note = `nghttp3 rejected this file: ${(error as Error).message}`;
+    }
 
     if (qifText === null) {
         corpusCase.referenceOk = true;
@@ -150,9 +164,12 @@ const manifest: CorpusManifest = {
 await fs.writeFile(CORPUS_MANIFEST_PATH, JSON.stringify(manifest, null, 2));
 
 const excluded = cases.filter((c) => !c.referenceOk);
+const nghttp3Disagreements = cases.filter((c) => c.referenceOk && !c.nghttp3Ok);
 console.log(
     `Corpus manifest built: ${cases.length} cases ` +
-    `(${excluded.length} excluded), ${errorCases.length} error cases ` +
+    `(${excluded.length} excluded, ${nghttp3Disagreements.length} nghttp3 ` +
+    `disagreements), ${errorCases.length} error cases ` +
     `(${errorCases.filter((c) => c.rejectedByReference).length} rejected by reference)`
 );
 for (const c of excluded) console.log(`  excluded: ${c.id}: ${c.note}`);
+for (const c of nghttp3Disagreements) console.log(`  nghttp3: ${c.id}: ${c.nghttp3Note}`);

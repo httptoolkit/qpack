@@ -3,6 +3,7 @@ import { expect } from 'chai';
 import { parseQif, serializeQif, decodedBlocksInStreamOrder } from './harness/qif.js';
 import { readInteropBlocks, writeInteropBlocks, ENCODER_STREAM_ID } from './harness/framing.js';
 import { lsqpackDecode, lsqpackEncode } from './harness/lsqpack.js';
+import { nghttp3Decode, nghttp3Encode } from './harness/nghttp3.js';
 import { loadCorpusManifest, readCorpusFile, readQif, readReferenceDecoding, QIF_NAMES } from './harness/corpus.js';
 import { sortedBlockEntries, hex } from './harness/utils.js';
 
@@ -105,6 +106,35 @@ describe('test harness', function () {
         });
     });
 
+    describe('nghttp3 reference implementation', () => {
+        it('decodes a corpus file back to its source QIF', async () => {
+            const encoded = await readCorpusFile(
+                'encoded/qpack-06/ls-qpack/fb-req.out.4096.100.1'
+            );
+            const decoded = await nghttp3Decode(encoded, {
+                tableSize: 4096,
+                maxBlocked: 100
+            });
+
+            const expected = parseQif(await readQif('qifs/fb-req.qif'));
+            expect(decoded).to.deep.equal(expected);
+        });
+
+        it('round-trips fresh encodings through encode and decode', async () => {
+            const blocks = parseQif(await readQif('qifs/fb-req.qif')).slice(0, 20);
+            const qifText = serializeQif(blocks);
+
+            for (const settings of [
+                { tableSize: 0, maxBlocked: 0, ackMode: 0 as const },
+                { tableSize: 4096, maxBlocked: 100, ackMode: 1 as const }
+            ]) {
+                const encoded = await nghttp3Encode(qifText, settings);
+                const decoded = await nghttp3Decode(encoded, settings);
+                expect(decoded, JSON.stringify(settings)).to.deep.equal(blocks);
+            }
+        });
+    });
+
     describe('corpus manifest', () => {
         it('covers the entire corpus with no unexplained exclusions', async () => {
             const manifest = await loadCorpusManifest();
@@ -120,6 +150,11 @@ describe('test harness', function () {
             // Implementation variety - at least 5 independent encoders:
             const impls = new Set(manifest.cases.map((c) => c.id.split('/')[1]));
             expect(impls.size).to.be.greaterThanOrEqual(5);
+
+            // And nghttp3 independently agrees with every ls-qpack decoding:
+            const disagreements = manifest.cases.filter((c) => !c.nghttp3Ok);
+            expect(disagreements.map((c) => `${c.id}: ${c.nghttp3Note}`))
+                .to.deep.equal([]);
         });
 
         it('provides parseable reference decodings', async () => {

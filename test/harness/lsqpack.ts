@@ -16,7 +16,7 @@ const INTEROP_DECODE = path.join(TOOLS_DIR, 'bin', 'interop-decode');
 export const MISSING_TOOLS_MESSAGE =
     'Test tools not found - run `npm run setup-test-tools` first';
 
-function runTool(binary: string, args: string[], stdin: Uint8Array): Promise<Buffer> {
+export function runTool(binary: string, args: string[], stdin: Uint8Array): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const proc = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 

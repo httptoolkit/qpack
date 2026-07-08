@@ -26,6 +26,12 @@ export interface CorpusCase {
      */
     referenceOk: boolean;
     note?: string;
+    /**
+     * Whether nghttp3's decoder also successfully decoded this file to the
+     * same result, as a second independent validation of the corpus.
+     */
+    nghttp3Ok: boolean;
+    nghttp3Note?: string;
     /** Path of the reference-decoded output, relative to test/tools */
     decodedPath: string | null;
 }

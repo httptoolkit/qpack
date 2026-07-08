@@ -6,6 +6,7 @@ import { QIF_NAMES, readQif } from './harness/corpus.js';
 import { parseQif, decodedBlocksInStreamOrder } from './harness/qif.js';
 import { writeInteropBlocks, type InteropBlock, ENCODER_STREAM_ID } from './harness/framing.js';
 import { lsqpackDecode } from './harness/lsqpack.js';
+import { nghttp3Decode } from './harness/nghttp3.js';
 
 const TABLE_SIZES = [0, 256, 4096];
 const MAX_BLOCKED = [0, 100];
@@ -16,10 +17,11 @@ for (const name of QIF_NAMES) {
 }
 
 /**
- * Encodes every corpus QIF with our encoder, then has ls-qpack's reference
- * decoder decode the result and checks it gets the original input back.
- * There is no acknowledgment channel here (the reference decoder is offline),
- * so this exercises unacknowledged encoding only.
+ * Encodes every corpus QIF with our encoder, then has both ls-qpack's and
+ * nghttp3's reference decoders decode the result and checks they get the
+ * original input back. There is no acknowledgment channel here (the
+ * reference decoders are offline), so this exercises unacknowledged
+ * encoding only.
  */
 describe('encode cross-check', function () {
     this.timeout(30000);
@@ -46,11 +48,14 @@ describe('encode cross-check', function () {
                         interopBlocks.push({ streamId: i + 1, data: fieldSection });
                     }
 
-                    const decoded = await lsqpackDecode(
-                        writeInteropBlocks(interopBlocks),
-                        { tableSize, maxBlocked }
-                    );
-                    expect(decodedBlocksInStreamOrder(decoded)).to.deep.equal(blocks);
+                    const interopFile = writeInteropBlocks(interopBlocks);
+
+                    const decoded = await lsqpackDecode(interopFile, { tableSize, maxBlocked });
+                    expect(decodedBlocksInStreamOrder(decoded), 'ls-qpack')
+                        .to.deep.equal(blocks);
+
+                    const nghttp3Decoded = await nghttp3Decode(interopFile, { tableSize, maxBlocked });
+                    expect(nghttp3Decoded, 'nghttp3').to.deep.equal(blocks);
                 });
             }
         }
