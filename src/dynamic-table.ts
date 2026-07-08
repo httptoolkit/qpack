@@ -22,6 +22,11 @@ export class DynamicTable {
         return this.evictedCount + this.entries.length;
     }
 
+    /** The absolute index of the oldest entry still in the table */
+    get firstIndex(): number {
+        return this.evictedCount;
+    }
+
     get size(): number {
         return this.currentSize;
     }
