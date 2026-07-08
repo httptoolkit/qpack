@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 
 import { QpackEncoder, type HeaderField } from '../src/index.js';
-import { qit } from './harness/disabled.js';
+
 import { QIF_NAMES, readQif } from './harness/corpus.js';
 import { parseQif, decodedBlocksInStreamOrder } from './harness/qif.js';
 import { writeInteropBlocks, type InteropBlock, ENCODER_STREAM_ID } from './harness/framing.js';
@@ -27,7 +27,7 @@ describe('encode cross-check', function () {
     for (const [name, blocks] of qifBlocks) {
         for (const tableSize of TABLE_SIZES) {
             for (const maxBlocked of MAX_BLOCKED) {
-                qit(`${name} (table ${tableSize}, blocked ${maxBlocked})`, async () => {
+                it(`${name} (table ${tableSize}, blocked ${maxBlocked})`, async () => {
                     const encoder = new QpackEncoder({
                         maxTableCapacity: tableSize,
                         maxBlockedStreams: maxBlocked

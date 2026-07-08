@@ -6,7 +6,6 @@ import { expect } from 'chai';
 
 import { STATIC_TABLE } from '../src/static-table.js';
 import type { HeaderField } from '../src/index.js';
-import { qit } from './harness/disabled.js';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 
@@ -31,7 +30,7 @@ describe('static table', () => {
         });
     });
 
-    qit('matches RFC 9204 appendix A', () => {
+    it('matches RFC 9204 appendix A', () => {
         expect(STATIC_TABLE).to.deep.equal(EXPECTED_TABLE);
     });
 

@@ -1,6 +1,5 @@
 import { expect } from 'chai';
 
-import { qit } from './harness/disabled.js';
 import { parseQif, serializeQif, decodedBlocksInStreamOrder } from './harness/qif.js';
 import { readInteropBlocks, writeInteropBlocks, ENCODER_STREAM_ID } from './harness/framing.js';
 import { lsqpackDecode, lsqpackEncode } from './harness/lsqpack.js';
@@ -142,24 +141,15 @@ describe('test harness', function () {
 
             expect(manifest.errorCases.length).to.equal(12);
 
-            // The reference decoder accepts err9 and err10 at our test
-            // settings (4096/100) - possibly errors only under other
-            // settings, or leniency. To investigate in the hardening stage:
+            // The reference decoder accepts err9 and err10: they are
+            // draft-era fixtures (indexed static entries 0 and 62, invalid
+            // against the smaller draft-05 static table) that are valid
+            // field sections under RFC 9204's 99-entry table:
             const accepted = manifest.errorCases
                 .filter((c) => !c.rejectedByReference)
                 .map((c) => c.id)
                 .sort();
             expect(accepted).to.deep.equal(['errors/err10', 'errors/err9']);
-        });
-    });
-
-    // A permanent canary exercising the disabled-list machinery: this test
-    // always throws, and only its (clearly-marked, permanent) entry in
-    // test/disabled-tests.ts makes the suite green. If the disabled-test
-    // handling breaks, this fails the build.
-    describe('disabled test handling', () => {
-        qit('expected-failure canary', () => {
-            throw new Error('This test always fails: the disabled list must absorb it');
         });
     });
 

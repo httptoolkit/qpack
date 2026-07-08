@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 
 import { QpackEncoder, QpackDecoder, type HeaderField } from '../src/index.js';
-import { qit, withTimeout } from './harness/disabled.js';
+import { withTimeout } from './harness/utils.js';
 import { QIF_NAMES, readQif } from './harness/corpus.js';
 import { parseQif } from './harness/qif.js';
 import { lsqpackEncode } from './harness/lsqpack.js';
@@ -41,7 +41,7 @@ describe('compression', function () {
 
     for (const name of QIF_NAMES) {
         for (const { tableSize, maxBlocked, ackMode } of SETTINGS) {
-            qit(
+            it(
                 `${name} (table ${tableSize}, blocked ${maxBlocked}, ack ${ackMode}) ` +
                 `compresses within ${SIZE_FACTOR}x of ls-qpack`,
                 async () => {

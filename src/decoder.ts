@@ -108,12 +108,16 @@ export class QpackDecoder {
         if (firstByte & 0x80) { // Insert with name reference (T=0x40: static)
             const nameIndex = decodePrefixedInt(data, offset, 6);
             if (nameIndex === null) return null;
-            const value = decodeStringLiteral(data, nameIndex.end, 7);
-            if (value === null) return null;
 
+            // Resolve the reference immediately: an invalid name index is an
+            // error even while the rest of the instruction is still in flight:
             const name = (firstByte & 0x40)
                 ? this.staticEntry(nameIndex.value).name
                 : this.insertedEntry(nameIndex.value).name;
+
+            const value = decodeStringLiteral(data, nameIndex.end, 7);
+            if (value === null) return null;
+
             this.insertEntry({ name, value: value.value });
             return value.end;
         } else if (firstByte & 0x40) { // Insert with literal name (H=0x20)

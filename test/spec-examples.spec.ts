@@ -1,8 +1,7 @@
 import { expect } from 'chai';
 
 import { QpackDecoder } from '../src/index.js';
-import { qit, withTimeout } from './harness/disabled.js';
-import { hex, expectRejection } from './harness/utils.js';
+import { hex, expectRejection, withTimeout } from './harness/utils.js';
 
 /**
  * The worked examples from RFC 9204 appendix B, used as byte-exact decoder
@@ -45,7 +44,7 @@ describe('RFC 9204 appendix B', () => {
         return decoder;
     };
 
-    qit('B.1 literal field line with name reference', async () => {
+    it('B.1 literal field line with name reference', async () => {
         const decoder = new QpackDecoder();
         const headers = await withTimeout(decoder.decodeFieldSection(
             0,
@@ -59,7 +58,7 @@ describe('RFC 9204 appendix B', () => {
         expect(decoder.takeDecoderStreamData()).to.deep.equal(new Uint8Array(0));
     });
 
-    qit('B.2 dynamic table insertions and a referencing field section', async () => {
+    it('B.2 dynamic table insertions and a referencing field section', async () => {
         const decoder = newDecoder();
         decoder.processEncoderStreamData(B2_ENCODER_INSTRUCTIONS);
 
@@ -78,7 +77,7 @@ describe('RFC 9204 appendix B', () => {
         expect(decoder.takeDecoderStreamData()).to.deep.equal(hex('84'));
     });
 
-    qit('B.2 field section blocks until its insertions arrive', async () => {
+    it('B.2 field section blocks until its insertions arrive', async () => {
         const decoder = newDecoder();
 
         let decoded = false;
@@ -96,7 +95,7 @@ describe('RFC 9204 appendix B', () => {
         ]);
     });
 
-    qit('B.3 speculative insert with a literal name', () => {
+    it('B.3 speculative insert with a literal name', () => {
         const decoder = newDecoder();
         decoder.processEncoderStreamData(B2_ENCODER_INSTRUCTIONS);
         decoder.takeDecoderStreamData();
@@ -107,7 +106,7 @@ describe('RFC 9204 appendix B', () => {
         expect(decoder.takeDecoderStreamData()).to.deep.equal(hex('01'));
     });
 
-    qit('B.4 duplicate instruction and field section', async () => {
+    it('B.4 duplicate instruction and field section', async () => {
         const decoder = setUpThroughB3();
 
         decoder.processEncoderStreamData(B4_ENCODER_INSTRUCTIONS);
@@ -126,7 +125,7 @@ describe('RFC 9204 appendix B', () => {
         expect(decoder.takeDecoderStreamData()).to.deep.equal(hex('88'));
     });
 
-    qit('B.4 stream cancellation while blocked', async () => {
+    it('B.4 stream cancellation while blocked', async () => {
         const decoder = setUpThroughB3();
 
         // The encoder stream data with the Duplicate instruction is delayed,
@@ -147,7 +146,7 @@ describe('RFC 9204 appendix B', () => {
         expect(decoder.takeDecoderStreamData()).to.deep.equal(hex('01'));
     });
 
-    qit('B.5 insert with dynamic name reference, evicting an entry', async () => {
+    it('B.5 insert with dynamic name reference, evicting an entry', async () => {
         const decoder = setUpThroughB3();
         decoder.processEncoderStreamData(B4_ENCODER_INSTRUCTIONS);
         decoder.takeDecoderStreamData();
@@ -165,7 +164,7 @@ describe('RFC 9204 appendix B', () => {
         expect(decoder.takeDecoderStreamData()).to.deep.equal(hex('8c')); // Ack, stream 12
     });
 
-    qit('B.5 references to evicted entries are rejected', async () => {
+    it('B.5 references to evicted entries are rejected', async () => {
         const decoder = setUpThroughB3();
         decoder.processEncoderStreamData(B4_ENCODER_INSTRUCTIONS);
         decoder.processEncoderStreamData(B5_ENCODER_INSTRUCTIONS);

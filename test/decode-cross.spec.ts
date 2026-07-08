@@ -1,7 +1,6 @@
 import { expect } from 'chai';
 
 import { QpackDecoder, type HeaderField } from '../src/index.js';
-import { qit, withTimeout } from './harness/disabled.js';
 import { QIF_NAMES, readQif } from './harness/corpus.js';
 import { parseQif } from './harness/qif.js';
 import {
@@ -10,7 +9,7 @@ import {
     ENCODER_STREAM_ID
 } from './harness/framing.js';
 import { lsqpackEncode, type InteropEncodeSettings } from './harness/lsqpack.js';
-import { sortedBlockEntries } from './harness/utils.js';
+import { sortedBlockEntries, withTimeout } from './harness/utils.js';
 
 const TABLE_SIZES = [0, 256, 4096];
 const MAX_BLOCKED = [0, 100];
@@ -69,7 +68,7 @@ describe('decode cross-check', function () {
         for (const tableSize of TABLE_SIZES) {
             for (const maxBlocked of MAX_BLOCKED) {
                 for (const ackMode of ACK_MODES) {
-                    qit(
+                    it(
                         `${name} (table ${tableSize}, blocked ${maxBlocked}, ack ${ackMode})`,
                         () => decodeCrossCheck(name, { tableSize, maxBlocked, ackMode })
                     );
@@ -77,7 +76,7 @@ describe('decode cross-check', function () {
             }
         }
 
-        qit(`${name} (table 4096, blocked 100, ack 1, aggressive)`, () =>
+        it(`${name} (table 4096, blocked 100, ack 1, aggressive)`, () =>
             decodeCrossCheck(name, {
                 tableSize: 4096,
                 maxBlocked: 100,

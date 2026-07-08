@@ -1,5 +1,5 @@
 import { QpackDecoder, QpackError, type HeaderField } from '../src/index.js';
-import { qit, withTimeout } from './harness/disabled.js';
+import { withTimeout } from './harness/utils.js';
 import { loadCorpusManifest, readCorpusFile } from './harness/corpus.js';
 import {
     readInteropBlocks,
@@ -19,7 +19,7 @@ describe('error corpus', () => {
     for (const errorCase of manifest.errorCases) {
         if (!errorCase.rejectedByReference) continue;
 
-        qit(`${errorCase.id} is rejected`, async () => {
+        it(`${errorCase.id} is rejected`, async () => {
             const encoded = await readCorpusFile(errorCase.encodedPath);
             const blocks = readInteropBlocks(encoded);
 

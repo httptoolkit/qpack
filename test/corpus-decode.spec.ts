@@ -1,14 +1,13 @@
 import { expect } from 'chai';
 
 import { QpackDecoder, type HeaderField } from '../src/index.js';
-import { qit, withTimeout } from './harness/disabled.js';
 import { loadCorpusManifest, readCorpusFile, readReferenceDecoding } from './harness/corpus.js';
 import {
     readInteropBlocks,
     impliedCapacityInstruction,
     ENCODER_STREAM_ID
 } from './harness/framing.js';
-import { sortedBlockEntries } from './harness/utils.js';
+import { sortedBlockEntries, withTimeout } from './harness/utils.js';
 
 const manifest = await loadCorpusManifest();
 
@@ -22,7 +21,7 @@ describe('corpus decode', () => {
     for (const corpusCase of manifest.cases) {
         if (!corpusCase.referenceOk) continue;
 
-        qit(`${corpusCase.id} (table size ${corpusCase.tableSize})`, async () => {
+        it(`${corpusCase.id} (table size ${corpusCase.tableSize})`, async () => {
             const encoded = await readCorpusFile(corpusCase.encodedPath);
             const blocks = readInteropBlocks(encoded);
 

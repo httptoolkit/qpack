@@ -2,7 +2,7 @@ import { expect } from 'chai';
 
 import { huffmanEncode, huffmanDecode } from '../src/huffman.js';
 import { QpackError } from '../src/index.js';
-import { qit } from './harness/disabled.js';
+
 import { hex, utf8 } from './harness/utils.js';
 
 // Huffman-encoded strings from the worked examples in RFC 7541 appendix C:
@@ -26,16 +26,16 @@ const VECTORS: Array<[text: string, encoded: string]> = [
 describe('huffman coding', () => {
 
     for (const [text, encoded] of VECTORS) {
-        qit(`encode "${text}"`, () => {
+        it(`encode "${text}"`, () => {
             expect(huffmanEncode(utf8(text))).to.deep.equal(hex(encoded));
         });
 
-        qit(`decode "${text}"`, () => {
+        it(`decode "${text}"`, () => {
             expect(huffmanDecode(hex(encoded))).to.deep.equal(utf8(text));
         });
     }
 
-    qit('round-trip every individual byte value', () => {
+    it('round-trip every individual byte value', () => {
         for (let byte = 0; byte < 256; byte++) {
             const input = Uint8Array.from([byte]);
             expect(huffmanDecode(huffmanEncode(input)), `byte ${byte}`)
@@ -43,7 +43,7 @@ describe('huffman coding', () => {
         }
     });
 
-    qit('round-trip random binary data', () => {
+    it('round-trip random binary data', () => {
         // Simple deterministic PRNG (xorshift32) so failures are reproducible:
         let state = 0xdeadbeef;
         const nextByte = () => {
@@ -60,24 +60,24 @@ describe('huffman coding', () => {
         }
     });
 
-    qit('encode an empty input to an empty output', () => {
+    it('encode an empty input to an empty output', () => {
         expect(huffmanEncode(new Uint8Array(0))).to.deep.equal(new Uint8Array(0));
         expect(huffmanDecode(new Uint8Array(0))).to.deep.equal(new Uint8Array(0));
     });
 
-    qit('decode rejects the EOS symbol in the input', () => {
+    it('decode rejects the EOS symbol in the input', () => {
         // 30 one-bits (the EOS code) followed by 2 one-bits of padding.
         // RFC 7541 s5.2: EOS in the input MUST be a decoding error.
         expect(() => huffmanDecode(hex('ff ff ff ff'))).to.throw(QpackError);
     });
 
-    qit('decode rejects padding longer than 7 bits', () => {
+    it('decode rejects padding longer than 7 bits', () => {
         // 16 one-bits: all-ones is always a strict prefix of EOS, so this is
         // 16 bits of padding, and >7 bits MUST be a decoding error.
         expect(() => huffmanDecode(hex('ff ff'))).to.throw(QpackError);
     });
 
-    qit('decode rejects padding that does not match the EOS prefix', () => {
+    it('decode rejects padding that does not match the EOS prefix', () => {
         // 'a' encodes to 00011 (5 bits), leaving 3 bits of padding, which
         // here is 000 instead of the required 111.
         expect(() => huffmanDecode(hex('18'))).to.throw(QpackError);

@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 
 import { QpackEncoder, QpackDecoder, type HeaderField } from '../src/index.js';
-import { qit, withTimeout } from './harness/disabled.js';
+import { withTimeout } from './harness/utils.js';
 import { QIF_NAMES, readQif } from './harness/corpus.js';
 import { parseQif } from './harness/qif.js';
 
@@ -67,7 +67,7 @@ describe('round trip', function () {
         for (const tableSize of TABLE_SIZES) {
             for (const maxBlocked of MAX_BLOCKED) {
                 for (const ackMode of ACK_MODES) {
-                    qit(
+                    it(
                         `${name} (table ${tableSize}, blocked ${maxBlocked}, ack ${ackMode})`,
                         () => roundTrip(blocks, { tableSize, maxBlocked, ackMode })
                     );
@@ -75,7 +75,7 @@ describe('round trip', function () {
             }
         }
 
-        qit(`${name} (table 4096, blocked 100, ack 1, no huffman)`, () =>
+        it(`${name} (table 4096, blocked 100, ack 1, no huffman)`, () =>
             roundTrip(blocks, {
                 tableSize: 4096,
                 maxBlocked: 100,
