@@ -1,5 +1,5 @@
 import type { HeaderField } from './types.js';
-import { QpackError } from './errors.js';
+import { QpackError, FieldSectionTooLargeError } from './errors.js';
 import { encodePrefixedInt, decodePrefixedInt, type DecodedInt } from './prefixed-int.js';
 import { decodeStringLiteral, concatBytes, type DecodedString } from './strings.js';
 import { STATIC_TABLE } from './static-table.js';
@@ -19,6 +19,26 @@ export interface QpackDecoderOptions {
      * insertions at any one time. Defaults to 0.
      */
     maxBlockedStreams?: number;
+
+    /**
+     * Our advertised SETTINGS_MAX_FIELD_SECTION_SIZE: the largest field
+     * section (as the uncompressed sum of name + value + 32 per field) we
+     * are willing to decode. Larger sections fail with
+     * FieldSectionTooLargeError - a stream-level problem for the caller to
+     * handle (e.g. resetting the stream or responding with 431), not a
+     * connection error. Defaults to unlimited, per RFC 9114.
+     */
+    maxFieldSectionSize?: number;
+
+    /**
+     * Receives decoder stream data (section acknowledgments, stream
+     * cancellations, insert count increments) as it is produced, including
+     * acknowledgments generated when a blocked section unblocks. When not
+     * set, this data must instead be drained via takeDecoderStreamData()
+     * after every processEncoderStreamData, decodeFieldSection and
+     * cancelStream call.
+     */
+    onDecoderStreamData?: (data: Uint8Array) => void;
 }
 
 interface BlockedSection {
@@ -32,6 +52,8 @@ interface BlockedSection {
 export class QpackDecoder {
     private readonly maxTableCapacity: number;
     private readonly maxBlockedStreams: number;
+    private readonly maxFieldSectionSize: number;
+    private readonly onDecoderStreamData?: (data: Uint8Array) => void;
 
     private readonly table = new DynamicTable();
     private blockedSections: BlockedSection[] = [];
@@ -49,6 +71,16 @@ export class QpackDecoder {
     constructor(options: QpackDecoderOptions = {}) {
         this.maxTableCapacity = options.maxTableCapacity ?? 0;
         this.maxBlockedStreams = options.maxBlockedStreams ?? 0;
+        this.maxFieldSectionSize = options.maxFieldSectionSize ?? Infinity;
+        this.onDecoderStreamData = options.onDecoderStreamData;
+    }
+
+    private queueDecoderStreamData(data: Uint8Array): void {
+        if (this.onDecoderStreamData) {
+            this.onDecoderStreamData(data);
+        } else {
+            this.pendingDecoderStreamData.push(data);
+        }
     }
 
     /** MaxEntries as defined in RFC 9204 s4.5.1.1 */
@@ -89,7 +121,7 @@ export class QpackDecoder {
             // of insertions is a policy choice (RFC 9204 s4.4.3 leaves the
             // timing open): it keeps the encoder's view current even when
             // nothing referencing the entries is decoded.
-            this.pendingDecoderStreamData.push(encodePrefixedInt(
+            this.queueDecoderStreamData(encodePrefixedInt(
                 this.table.insertCount - this.peerKnownInsertCount, 6, 0x00
             ));
             this.peerKnownInsertCount = this.table.insertCount;
@@ -237,18 +269,33 @@ export class QpackDecoder {
         requiredInsertCount: DecodedInt
     ): HeaderField[] {
         const base = this.decodeBase(data, requiredInsertCount);
-        const headers = this.parseFieldLines(
-            data,
-            base.end,
-            base.value,
-            requiredInsertCount.value
-        );
+
+        let headers: HeaderField[];
+        try {
+            headers = this.parseFieldLines(
+                data,
+                base.end,
+                base.value,
+                requiredInsertCount.value
+            );
+        } catch (error) {
+            if (error instanceof FieldSectionTooLargeError
+                && this.maxTableCapacity > 0
+            ) {
+                // Reading this section is being abandoned, which the encoder
+                // must hear about to release its references (RFC 9204
+                // s2.2.2.2); as elsewhere, omitted when the dynamic table is
+                // wholly disabled:
+                this.queueDecoderStreamData(encodePrefixedInt(streamId, 6, 0x40));
+            }
+            throw error;
+        }
 
         if (requiredInsertCount.value > 0) {
             // Section Acknowledgment (required by RFC 9204 s4.4.1). This also
             // tells the peer about every insertion up to this section's
             // Required Insert Count:
-            this.pendingDecoderStreamData.push(encodePrefixedInt(streamId, 7, 0x80));
+            this.queueDecoderStreamData(encodePrefixedInt(streamId, 7, 0x80));
             this.peerKnownInsertCount = Math.max(
                 this.peerKnownInsertCount,
                 requiredInsertCount.value
@@ -321,6 +368,19 @@ export class QpackDecoder {
         requiredInsertCount: number
     ): HeaderField[] {
         const headers: HeaderField[] = [];
+        let sectionSize = 0;
+
+        // Reads a string literal, rejecting raw literals that alone already
+        // exceed the remaining section size budget before materializing them:
+        const readString = (stringOffset: number, prefixBits: number): DecodedString => {
+            const isHuffman = stringOffset < data.length
+                && (data[stringOffset]! & (1 << prefixBits)) !== 0;
+            const length = this.required(decodePrefixedInt(data, stringOffset, prefixBits));
+            if (!isHuffman && sectionSize + length.value > this.maxFieldSectionSize) {
+                throw this.fieldSectionTooLarge(sectionSize + length.value);
+            }
+            return this.required(decodeStringLiteral(data, stringOffset, prefixBits));
+        };
 
         while (offset < data.length) {
             const firstByte = data[offset]!;
@@ -339,13 +399,13 @@ export class QpackDecoder {
                 const name = (firstByte & 0x10)
                     ? this.staticEntry(index.value).name
                     : this.dynamicEntry(base - index.value - 1, requiredInsertCount).name;
-                const value = this.required(decodeStringLiteral(data, index.end, 7));
+                const value = readString(index.end, 7);
                 headers.push({ name, value: value.value });
                 offset = value.end;
             } else if (firstByte & 0x20) {
                 // Literal field line with literal name (N=0x10, H=0x08)
-                const name = this.required(decodeStringLiteral(data, offset, 3));
-                const value = this.required(decodeStringLiteral(data, name.end, 7));
+                const name = readString(offset, 3);
+                const value = readString(name.end, 7);
                 headers.push({ name: name.value, value: value.value });
                 offset = value.end;
             } else if (firstByte & 0x10) {
@@ -357,13 +417,26 @@ export class QpackDecoder {
                 // Literal field line with post-base name reference (N=0x08)
                 const index = this.required(decodePrefixedInt(data, offset, 3));
                 const name = this.dynamicEntry(base + index.value, requiredInsertCount).name;
-                const value = this.required(decodeStringLiteral(data, index.end, 7));
+                const value = readString(index.end, 7);
                 headers.push({ name, value: value.value });
                 offset = value.end;
+            }
+
+            sectionSize += entrySize(headers[headers.length - 1]!);
+            if (sectionSize > this.maxFieldSectionSize) {
+                throw this.fieldSectionTooLarge(sectionSize);
             }
         }
 
         return headers;
+    }
+
+    private fieldSectionTooLarge(size: number): FieldSectionTooLargeError {
+        return new FieldSectionTooLargeError(
+            this.maxFieldSectionSize,
+            `Field section of at least ${size} exceeds our advertised limit ` +
+            `of ${this.maxFieldSectionSize}`
+        );
     }
 
     private staticEntry(index: number): HeaderField {
@@ -419,13 +492,18 @@ export class QpackDecoder {
         // omit cancellations entirely (permitted by RFC 9204 s2.2.2.2):
         if (this.maxTableCapacity === 0) return;
 
-        this.pendingDecoderStreamData.push(encodePrefixedInt(streamId, 6, 0x40));
+        this.queueDecoderStreamData(encodePrefixedInt(streamId, 6, 0x40));
     }
 
     /**
      * Drain any pending output for the decoder stream (section
      * acknowledgments, stream cancellations and insert count increments).
      * Returns an empty array if there is nothing to send.
+     *
+     * New output can be produced by any processEncoderStreamData,
+     * decodeFieldSection or cancelStream call, so drain after each of those
+     * - or set the onDecoderStreamData option to receive it as it appears,
+     * in which case this method is unused.
      */
     takeDecoderStreamData(): Uint8Array {
         if (this.pendingDecoderStreamData.length === 0) return new Uint8Array(0);

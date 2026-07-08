@@ -10,6 +10,22 @@ export const QPACK_ERROR_CODES: { [K in QpackErrorCode]: number } = {
     QPACK_DECODER_STREAM_ERROR: 0x202
 };
 
+/**
+ * A field section exceeding the local (when decoding) or the peer's (when
+ * encoding) SETTINGS_MAX_FIELD_SECTION_SIZE limit. Unlike QpackError this
+ * is not a connection error: the caller chooses how to handle it (e.g.
+ * resetting the stream, or responding with 431).
+ */
+export class FieldSectionTooLargeError extends Error {
+    constructor(
+        readonly limit: number,
+        message: string
+    ) {
+        super(message);
+        this.name = 'FieldSectionTooLargeError';
+    }
+}
+
 export class QpackError extends Error {
     constructor(
         readonly code: QpackErrorCode,

@@ -10,6 +10,8 @@ export {
 } from './decoder.js';
 export {
     QpackError,
+    FieldSectionTooLargeError,
     QPACK_ERROR_CODES,
     type QpackErrorCode
 } from './errors.js';
+export type { QpackPeerSettings } from './encoder.js';

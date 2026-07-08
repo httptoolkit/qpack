@@ -1,11 +1,18 @@
 import type { HeaderField } from './types.js';
-import { QpackError } from './errors.js';
+import { QpackError, FieldSectionTooLargeError } from './errors.js';
 import { encodePrefixedInt, decodePrefixedInt } from './prefixed-int.js';
 import { encodeStringLiteral, concatBytes } from './strings.js';
 import { STATIC_EXACT_MATCHES, STATIC_NAME_MATCHES } from './static-table.js';
 import { DynamicTable, entrySize } from './dynamic-table.js';
 
-export interface QpackEncoderOptions {
+/**
+ * The peer's QPACK-relevant SETTINGS values. In HTTP/3 these usually arrive
+ * after encoding has already started (requests are typically sent before the
+ * peer's SETTINGS frame is received), so they can also be applied later via
+ * setPeerSettings(); until then, the encoder works within the defaults (or
+ * any 0-RTT-remembered values passed at construction).
+ */
+export interface QpackPeerSettings {
     /**
      * The peer's advertised SETTINGS_QPACK_MAX_TABLE_CAPACITY. Defaults to 0,
      * which disables all dynamic table usage.
@@ -20,8 +27,18 @@ export interface QpackEncoderOptions {
     maxBlockedStreams?: number;
 
     /**
-     * The dynamic table capacity this encoder should actually use, which must
-     * be no larger than maxTableCapacity. Defaults to maxTableCapacity.
+     * The peer's advertised SETTINGS_MAX_FIELD_SECTION_SIZE: the largest
+     * field section (as the uncompressed sum of name + value + 32 per field)
+     * it is willing to accept. Defaults to unlimited, per RFC 9114.
+     */
+    maxFieldSectionSize?: number;
+}
+
+export interface QpackEncoderOptions extends QpackPeerSettings {
+    /**
+     * The dynamic table capacity this encoder should use, capped by the
+     * peer's maxTableCapacity whenever that is lower. Defaults to using the
+     * peer's full advertised capacity.
      */
     dynamicTableCapacity?: number;
 
@@ -73,13 +90,22 @@ const HISTORY_LIMIT = 4096;
 const UNACKED_INSERT_LIMIT = 16;
 
 export class QpackEncoder {
-    private readonly maxTableCapacity: number;
-    private readonly maxBlockedStreams: number;
-    private readonly dynamicTableCapacity: number;
+    private maxTableCapacity: number;
+    private maxBlockedStreams: number;
+    private maxFieldSectionSize: number;
+    /** The capacity the caller asked for, before capping by the peer's max */
+    private readonly requestedTableCapacity: number | undefined;
     private readonly useHuffman: boolean;
 
     private readonly table = new DynamicTable();
-    private capacitySent = false;
+    /** The capacity we've told the peer about (0 = no instruction sent yet) */
+    private lastSentCapacity = 0;
+    /**
+     * While the QUIC encoder stream is flow-control blocked, adding more
+     * instruction bytes would deadlock any section referencing them, so all
+     * insertion (and the capacity instruction) is suspended.
+     */
+    private backpressure = false;
 
     /** Newest absolute index per exact name+value in the dynamic table */
     private readonly tableByField = new Map<string, number>();
@@ -104,17 +130,11 @@ export class QpackEncoder {
     constructor(options: QpackEncoderOptions = {}) {
         this.maxTableCapacity = options.maxTableCapacity ?? 0;
         this.maxBlockedStreams = options.maxBlockedStreams ?? 0;
-        this.dynamicTableCapacity = options.dynamicTableCapacity ?? this.maxTableCapacity;
+        this.maxFieldSectionSize = options.maxFieldSectionSize ?? Infinity;
+        this.requestedTableCapacity = options.dynamicTableCapacity;
         this.useHuffman = options.useHuffman ?? true;
 
-        if (this.dynamicTableCapacity > this.maxTableCapacity) {
-            throw new Error(
-                `Dynamic table capacity (${this.dynamicTableCapacity}) cannot exceed ` +
-                `the peer's maximum (${this.maxTableCapacity})`
-            );
-        }
-
-        this.table.setCapacity(this.dynamicTableCapacity);
+        this.table.setCapacity(this.tableCapacityToUse);
     }
 
     /** MaxEntries as defined in RFC 9204 s4.5.1.1 (from the advertised maximum) */
@@ -122,14 +142,95 @@ export class QpackEncoder {
         return Math.floor(this.maxTableCapacity / 32);
     }
 
+    /** The requested capacity, capped by what the peer currently allows */
+    private get tableCapacityToUse(): number {
+        return Math.min(
+            this.requestedTableCapacity ?? this.maxTableCapacity,
+            this.maxTableCapacity
+        );
+    }
+
+    /**
+     * Apply the peer's SETTINGS values once they arrive (or updated 0-RTT
+     * values). Only omitted properties keep their current values.
+     *
+     * Throws if a new value conflicts with encoding state that already
+     * exists - which can only happen when the values passed at construction
+     * (e.g. remembered 0-RTT settings) were not honoured by the peer. The
+     * caller should treat that as an HTTP/3 settings error.
+     */
+    setPeerSettings(settings: QpackPeerSettings): void {
+        const newMaxCapacity = settings.maxTableCapacity ?? this.maxTableCapacity;
+        const newMaxBlocked = settings.maxBlockedStreams ?? this.maxBlockedStreams;
+
+        if (newMaxCapacity !== this.maxTableCapacity && this.lastSentCapacity > 0) {
+            if (newMaxCapacity < this.lastSentCapacity) {
+                throw new Error(
+                    `Peer's max table capacity (${newMaxCapacity}) is below the ` +
+                    `dynamic table capacity already in use (${this.lastSentCapacity})`
+                );
+            }
+            // MaxEntries (from the peer's advertised capacity) defines the
+            // modulus for Required Insert Count encoding. Sections already
+            // sent used the old value; they only decode identically under
+            // the new one if no wrapped encodings exist yet:
+            if (this.table.insertCount >= 2 * this.maxEntries) {
+                throw new Error(
+                    `Cannot adopt a changed max table capacity after ` +
+                    `${this.table.insertCount} insertions: sent field sections ` +
+                    `already depend on the previous MaxEntries value`
+                );
+            }
+        }
+
+        if (newMaxBlocked < this.maxBlockedStreams
+            && this.countStreamsAtRisk() > newMaxBlocked
+        ) {
+            throw new Error(
+                `Peer's max blocked streams (${newMaxBlocked}) is below the ` +
+                `number of streams already at risk (${this.countStreamsAtRisk()})`
+            );
+        }
+
+        this.maxTableCapacity = newMaxCapacity;
+        this.maxBlockedStreams = newMaxBlocked;
+        this.maxFieldSectionSize = settings.maxFieldSectionSize ?? this.maxFieldSectionSize;
+
+        this.table.setCapacity(this.tableCapacityToUse);
+    }
+
+    /**
+     * Notify the encoder of backpressure on the QUIC encoder stream: while
+     * active, no new encoder stream bytes are produced (no insertions, so
+     * compression is temporarily reduced), as writing instructions that
+     * can't be delivered would block every field section referencing them.
+     */
+    setEncoderStreamBackpressure(active: boolean): void {
+        this.backpressure = active;
+    }
+
     encodeFieldSection(streamId: number, headers: HeaderField[]): EncodedFieldSection {
+        // Enforced before any state changes, so a rejected section leaves
+        // the encoder fully usable:
+        const sectionSize = headers.reduce((sum, field) => sum + entrySize(field), 0);
+        if (sectionSize > this.maxFieldSectionSize) {
+            throw new FieldSectionTooLargeError(
+                this.maxFieldSectionSize,
+                `Field section of size ${sectionSize} exceeds the peer's ` +
+                `advertised limit of ${this.maxFieldSectionSize}`
+            );
+        }
+
         const encoderStream: Uint8Array[] = [];
 
-        if (!this.capacitySent && this.dynamicTableCapacity > 0) {
+        if (!this.backpressure && this.lastSentCapacity !== this.tableCapacityToUse) {
             // Set Dynamic Table Capacity, required before any use of the
-            // table as its initial capacity is 0 (RFC 9204 s3.2.3):
-            encoderStream.push(encodePrefixedInt(this.dynamicTableCapacity, 5, 0x20));
-            this.capacitySent = true;
+            // table as its initial capacity is 0 (RFC 9204 s3.2.3), and
+            // again if the usable capacity has since grown (e.g. once the
+            // peer's real SETTINGS arrived). Always emitted ahead of any
+            // insertions relying on it:
+            encoderStream.push(encodePrefixedInt(this.tableCapacityToUse, 5, 0x20));
+            this.lastSentCapacity = this.tableCapacityToUse;
         }
 
         // A section referencing any unacknowledged entry can block, which is
@@ -253,14 +354,23 @@ export class QpackEncoder {
             return { kind: 'literal', name, value };
         };
 
-        if (this.dynamicTableCapacity === 0) return literalPlan();
+        if (this.lastSentCapacity === 0) return literalPlan();
 
         const fieldKey = `${name}\0${value}`;
         const exactMatch = this.liveIndex(this.tableByField, fieldKey);
 
+        // Insertion requires encoder stream budget (no backpressure), an
+        // entry plausibly worth the space, and room without evicting
+        // anything referenced:
+        const worthInserting = !this.backpressure && (
+            canRisk
+            || this.table.insertCount - this.knownReceivedCount < UNACKED_INSERT_LIMIT
+        );
+        const canInsertNow = worthInserting && this.canInsert(field, pinned, canRisk);
+
         if (exactMatch !== null
             && (exactMatch < this.knownReceivedCount || canRisk)
-            && !(this.isDraining(exactMatch) && this.canInsert(field, pinned, canRisk))
+            && !(this.isDraining(exactMatch) && canInsertNow)
         ) {
             // Usable directly. (A draining match is still referenced rather
             // than falling back to a literal, unless it can be refreshed
@@ -274,10 +384,7 @@ export class QpackEncoder {
         const seenBefore = this.history.has(fieldKey);
         this.recordInHistory(fieldKey);
 
-        const worthInserting = canRisk
-            || this.table.insertCount - this.knownReceivedCount < UNACKED_INSERT_LIMIT;
-
-        if (seenBefore && worthInserting && this.canInsert(field, pinned, canRisk)) {
+        if (seenBefore && canInsertNow) {
             if (exactMatch !== null) {
                 // A draining exact match: refresh it with a Duplicate
                 encoderStream.push(encodePrefixedInt(
@@ -333,7 +440,7 @@ export class QpackEncoder {
      * treated as draining.
      */
     private isDraining(absoluteIndex: number): boolean {
-        const drainingLimit = this.dynamicTableCapacity / 8;
+        const drainingLimit = this.table.capacity / 8;
         let drained = 0;
         for (let i = this.table.firstIndex; i <= absoluteIndex; i++) {
             drained += entrySize(this.table.get(i)!);
@@ -353,9 +460,9 @@ export class QpackEncoder {
         allowEviction: boolean
     ): boolean {
         const size = entrySize(field);
-        if (size > this.dynamicTableCapacity) return false;
+        if (size > this.table.capacity) return false;
 
-        let toFree = this.table.size + size - this.dynamicTableCapacity;
+        let toFree = this.table.size + size - this.table.capacity;
 
         // An entry that can't be referenced until feedback arrives isn't
         // worth evicting entries that are already earning their keep - that
