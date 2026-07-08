@@ -57,6 +57,11 @@ export class QpackDecoder {
 
     private readonly table = new DynamicTable();
     private blockedSections: BlockedSection[] = [];
+    /**
+     * Streams cancelled locally (by cancelStream, or by abandoning an
+     * over-size section). Small: one entry per cancelled stream, only.
+     */
+    private readonly cancelledStreams = new Set<number>();
 
     /**
      * Our best lower bound on the peer's Known Received Count, from the
@@ -120,11 +125,12 @@ export class QpackDecoder {
             // Insert Count Increment. Emitting this eagerly for every batch
             // of insertions is a policy choice (RFC 9204 s4.4.3 leaves the
             // timing open): it keeps the encoder's view current even when
-            // nothing referencing the entries is decoded.
-            this.queueDecoderStreamData(encodePrefixedInt(
-                this.table.insertCount - this.peerKnownInsertCount, 6, 0x00
-            ));
+            // nothing referencing the entries is decoded. State is updated
+            // before queueing, as the onDecoderStreamData callback may
+            // re-enter the decoder synchronously:
+            const increment = this.table.insertCount - this.peerKnownInsertCount;
             this.peerKnownInsertCount = this.table.insertCount;
+            this.queueDecoderStreamData(encodePrefixedInt(increment, 6, 0x00));
 
             this.unblockReadySections();
         }
@@ -214,15 +220,48 @@ export class QpackDecoder {
      * The returned promise resolves once all dynamic table entries the
      * section requires have been received (immediately, unless the section
      * is blocked) and rejects with a QpackError if the section is invalid.
+     *
+     * A section exceeding maxFieldSectionSize rejects with
+     * FieldSectionTooLargeError; that abandons the whole stream (a Stream
+     * Cancellation is emitted, releasing the peer's state), so no further
+     * sections can be decoded on it and the caller must reset it.
      */
-    async decodeFieldSection(streamId: number, data: Uint8Array): Promise<HeaderField[]> {
+    decodeFieldSection(streamId: number, data: Uint8Array): Promise<HeaderField[]> {
+        try {
+            if (this.cancelledStreams.has(streamId)) {
+                throw new Error(
+                    `Cannot decode a field section on cancelled stream ${streamId}`
+                );
+            }
+            return this.decodeOrBlock(streamId, data);
+        } catch (error) {
+            // (A too-large rejection of a *blocked* section is handled where
+            // it unblocks, in unblockReadySections.)
+            if (error instanceof FieldSectionTooLargeError) {
+                this.abandonStream(streamId);
+            }
+            return Promise.reject(error);
+        }
+    }
+
+    private decodeOrBlock(streamId: number, data: Uint8Array): Promise<HeaderField[]> {
         const requiredInsertCount = this.decodeRequiredInsertCount(data);
 
         if (requiredInsertCount.value <= this.table.insertCount) {
-            return this.decodeSectionNow(streamId, data, requiredInsertCount);
+            return Promise.resolve(
+                this.decodeSectionNow(streamId, data, requiredInsertCount)
+            );
         }
 
-        // Blocked: wait for the required insertions to arrive.
+        // Blocked: wait for the required insertions to arrive. Every field
+        // line decodes to at least 8/30 of its wire size (the worst-case
+        // Huffman ratio; other forms expand more), so a section that cannot
+        // possibly fit the size limit is rejected instead of buffered:
+        const wireSize = data.length - requiredInsertCount.end;
+        if (wireSize * 8 > this.maxFieldSectionSize * 30) {
+            throw this.fieldSectionTooLarge(Math.ceil(wireSize * 8 / 30));
+        }
+
         const blockedStreams = new Set(this.blockedSections.map((s) => s.streamId));
         blockedStreams.add(streamId);
         if (blockedStreams.size > this.maxBlockedStreams) {
@@ -244,23 +283,37 @@ export class QpackDecoder {
     }
 
     private unblockReadySections(): void {
-        const stillBlocked: BlockedSection[] = [];
-        for (const section of this.blockedSections) {
-            if (section.requiredInsertCount.value > this.table.insertCount) {
-                stillBlocked.push(section);
-                continue;
-            }
-            try {
-                section.resolve(this.decodeSectionNow(
-                    section.streamId,
-                    section.data,
-                    section.requiredInsertCount
-                ));
-            } catch (error) {
-                section.reject(error as Error);
+        // Sections are removed from the live array before their decode runs:
+        // decoding emits acknowledgments, and the onDecoderStreamData
+        // callback may re-enter (e.g. cancelStream), so no stale copy of the
+        // list can be kept across those calls. Restart the scan after each
+        // decode for the same reason.
+        let scan = true;
+        while (scan) {
+            scan = false;
+            for (let i = 0; i < this.blockedSections.length; i++) {
+                const section = this.blockedSections[i]!;
+                if (section.requiredInsertCount.value > this.table.insertCount) {
+                    continue;
+                }
+
+                this.blockedSections.splice(i, 1);
+                try {
+                    section.resolve(this.decodeSectionNow(
+                        section.streamId,
+                        section.data,
+                        section.requiredInsertCount
+                    ));
+                } catch (error) {
+                    if (error instanceof FieldSectionTooLargeError) {
+                        this.abandonStream(section.streamId);
+                    }
+                    section.reject(error as Error);
+                }
+                scan = true;
+                break;
             }
         }
-        this.blockedSections = stillBlocked;
     }
 
     private decodeSectionNow(
@@ -269,37 +322,23 @@ export class QpackDecoder {
         requiredInsertCount: DecodedInt
     ): HeaderField[] {
         const base = this.decodeBase(data, requiredInsertCount);
-
-        let headers: HeaderField[];
-        try {
-            headers = this.parseFieldLines(
-                data,
-                base.end,
-                base.value,
-                requiredInsertCount.value
-            );
-        } catch (error) {
-            if (error instanceof FieldSectionTooLargeError
-                && this.maxTableCapacity > 0
-            ) {
-                // Reading this section is being abandoned, which the encoder
-                // must hear about to release its references (RFC 9204
-                // s2.2.2.2); as elsewhere, omitted when the dynamic table is
-                // wholly disabled:
-                this.queueDecoderStreamData(encodePrefixedInt(streamId, 6, 0x40));
-            }
-            throw error;
-        }
+        const headers = this.parseFieldLines(
+            data,
+            base.end,
+            base.value,
+            requiredInsertCount.value
+        );
 
         if (requiredInsertCount.value > 0) {
             // Section Acknowledgment (required by RFC 9204 s4.4.1). This also
             // tells the peer about every insertion up to this section's
-            // Required Insert Count:
-            this.queueDecoderStreamData(encodePrefixedInt(streamId, 7, 0x80));
+            // Required Insert Count, so that state is updated before queueing
+            // (the onDecoderStreamData callback may re-enter the decoder):
             this.peerKnownInsertCount = Math.max(
                 this.peerKnownInsertCount,
                 requiredInsertCount.value
             );
+            this.queueDecoderStreamData(encodePrefixedInt(streamId, 7, 0x80));
         }
 
         return headers;
@@ -368,19 +407,19 @@ export class QpackDecoder {
         requiredInsertCount: number
     ): HeaderField[] {
         const headers: HeaderField[] = [];
+        const checkSize = this.maxFieldSectionSize !== Infinity;
         let sectionSize = 0;
 
-        // Reads a string literal, rejecting raw literals that alone already
-        // exceed the remaining section size budget before materializing them:
-        const readString = (stringOffset: number, prefixBits: number): DecodedString => {
-            const isHuffman = stringOffset < data.length
-                && (data[stringOffset]! & (1 << prefixBits)) !== 0;
-            const length = this.required(decodePrefixedInt(data, stringOffset, prefixBits));
-            if (!isHuffman && sectionSize + length.value > this.maxFieldSectionSize) {
-                throw this.fieldSectionTooLarge(sectionSize + length.value);
-            }
-            return this.required(decodeStringLiteral(data, stringOffset, prefixBits));
-        };
+        // Reads a string literal within the remaining section size budget:
+        // over-budget strings fail before being materialized (see
+        // decodeStringLiteral), bounding the work spent on them:
+        const readString = (stringOffset: number, prefixBits: number): DecodedString =>
+            this.required(decodeStringLiteral(
+                data,
+                stringOffset,
+                prefixBits,
+                checkSize ? this.maxFieldSectionSize - sectionSize : Infinity
+            ));
 
         while (offset < data.length) {
             const firstByte = data[offset]!;
@@ -431,9 +470,11 @@ export class QpackDecoder {
                 offset = value.end;
             }
 
-            sectionSize += entrySize(headers[headers.length - 1]!);
-            if (sectionSize > this.maxFieldSectionSize) {
-                throw this.fieldSectionTooLarge(sectionSize);
+            if (checkSize) {
+                sectionSize += entrySize(headers[headers.length - 1]!);
+                if (sectionSize > this.maxFieldSectionSize) {
+                    throw this.fieldSectionTooLarge(sectionSize);
+                }
             }
         }
 
@@ -488,9 +529,19 @@ export class QpackDecoder {
 
     /**
      * Notify the decoder that a stream has been reset, so any blocked decode
-     * is abandoned and a Stream Cancellation can be emitted.
+     * is abandoned and a Stream Cancellation can be emitted. Idempotent, and
+     * no further field sections can be decoded on the stream afterwards: the
+     * cancellation releases all of the peer encoder's state for the stream,
+     * so a later acknowledgment would be a connection error.
      */
     cancelStream(streamId: number): void {
+        this.abandonStream(streamId);
+    }
+
+    private abandonStream(streamId: number): void {
+        if (this.cancelledStreams.has(streamId)) return;
+        this.cancelledStreams.add(streamId);
+
         const cancelled = this.blockedSections.filter((s) => s.streamId === streamId);
         this.blockedSections = this.blockedSections.filter((s) => s.streamId !== streamId);
         for (const section of cancelled) {

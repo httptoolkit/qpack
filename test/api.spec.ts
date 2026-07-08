@@ -11,7 +11,8 @@ import { parseQif, decodedBlocksInStreamOrder } from './harness/qif.js';
 import { writeInteropBlocks, type InteropBlock, ENCODER_STREAM_ID } from './harness/framing.js';
 import { lsqpackDecode } from './harness/lsqpack.js';
 import { nghttp3Decode } from './harness/nghttp3.js';
-import { withTimeout } from './harness/utils.js';
+import { hex, withTimeout, expectRejection } from './harness/utils.js';
+import { encodeStringLiteral, concatBytes } from '../src/strings.js';
 
 const fbReqBlocks = parseQif(await readQif(`qifs/${QIF_NAMES[0]}.qif`)).slice(0, 40);
 
@@ -139,9 +140,36 @@ describe('connection lifecycle API', function () {
             const { decoded } = encodeAll(encoder, decoder, blocks);
             await withTimeout(Promise.all(decoded));
 
-            const insertCount = (encoder as any).table.insertCount as number;
-            expect(insertCount).to.be.greaterThanOrEqual(16, 'precondition');
+            expect(encoder.dynamicTableInsertCount).to.be.greaterThanOrEqual(16, 'precondition');
 
+            expect(() => encoder.setPeerSettings({ maxTableCapacity: 512 }))
+                .to.throw(/already depend on the previous MaxEntries/);
+        });
+
+        it('rejects a capacity change that shrinks MaxEntries below sent encodings', async () => {
+            // 0-RTT-remembered max 4096 (MaxEntries 128), but only using a
+            // 256-byte table, so the capacity-in-use check alone passes:
+            const encoder = new QpackEncoder({
+                maxTableCapacity: 4096,
+                dynamicTableCapacity: 256,
+                maxBlockedStreams: 100
+            });
+            const decoder = new QpackDecoder({
+                maxTableCapacity: 4096,
+                maxBlockedStreams: 100
+            });
+
+            const blocks = Array.from({ length: 40 }, (_, i) => [
+                { name: 'x-custom', value: `value-${i}` },
+                { name: 'x-custom', value: `value-${i}` }
+            ]);
+            const { decoded } = encodeAll(encoder, decoder, blocks);
+            await withTimeout(Promise.all(decoded));
+
+            // The peer's real max would be 512: MaxEntries 16, so encodings
+            // past 32 insertions no longer fit its wraparound range even
+            // though 512 exceeds the 256 in use:
+            expect(encoder.dynamicTableInsertCount).to.be.greaterThanOrEqual(32, 'precondition');
             expect(() => encoder.setPeerSettings({ maxTableCapacity: 512 }))
                 .to.throw(/already depend on the previous MaxEntries/);
         });
@@ -202,6 +230,46 @@ describe('connection lifecycle API', function () {
                 .to.deep.equal([smallField, smallField, smallField]);
         });
 
+        it('decoder rejects oversized blocked sections instead of buffering them', async () => {
+            const decoder = new QpackDecoder({
+                maxTableCapacity: 4096,
+                maxBlockedStreams: 5,
+                maxFieldSectionSize: 100
+            });
+
+            // Required Insert Count 1 (never satisfied) with a large raw
+            // literal - must reject immediately, not sit blocked holding it:
+            const section = concatBytes([
+                hex('0200'), // RIC 1, Base 1
+                encodeStringLiteral('x-big', 3, 0x20, false),
+                encodeStringLiteral('y'.repeat(10_000), 7, 0, false)
+            ]);
+
+            const error = await withTimeout(
+                decoder.decodeFieldSection(1, section).then(
+                    () => { throw new Error('Decode should have failed'); },
+                    (e) => e
+                )
+            );
+            expect(error).to.be.an.instanceOf(FieldSectionTooLargeError);
+
+            // And the abandonment is signalled to the peer:
+            const feedback = decoder.takeDecoderStreamData();
+            expect(feedback[feedback.length - 1]).to.equal(0x41);
+        });
+
+        it('decoder rejects oversized Huffman literals without decoding them all', async () => {
+            const encoder = new QpackEncoder(); // Huffman on by default
+            const { fieldSection } = encoder.encodeFieldSection(1, [
+                { name: 'x-big', value: 'huffman huffman '.repeat(20_000) }
+            ]);
+
+            const decoder = new QpackDecoder({ maxFieldSectionSize: 1000 });
+            const error = await decoder.decodeFieldSection(1, fieldSection)
+                .then(() => { throw new Error('Decode should have failed'); }, (e) => e);
+            expect(error).to.be.an.instanceOf(FieldSectionTooLargeError);
+        });
+
         it('decoder rejects an oversized raw literal from its length alone', async () => {
             const encoder = new QpackEncoder({ useHuffman: false });
             const { fieldSection } = encoder.encodeFieldSection(1, [
@@ -250,6 +318,140 @@ describe('connection lifecycle API', function () {
             // stream 2 ('01' + 6-bit stream ID = 0x42):
             const feedback = decoder.takeDecoderStreamData();
             expect(feedback[feedback.length - 1]).to.equal(0x42);
+        });
+    });
+
+    describe('stream abandonment', () => {
+        it('rejects further sections on an abandoned stream, keeping the peer consistent', async () => {
+            const encoder = new QpackEncoder({
+                maxTableCapacity: 4096,
+                maxBlockedStreams: 100
+            });
+            const decoder = new QpackDecoder({
+                maxTableCapacity: 4096,
+                maxBlockedStreams: 100,
+                maxFieldSectionSize: 150
+            });
+
+            const smallField = { name: 'x-custom', value: 'value' };
+            const feedAll = (encoderStreamData: Uint8Array) => {
+                if (encoderStreamData.length > 0) {
+                    decoder.processEncoderStreamData(encoderStreamData);
+                }
+            };
+
+            // Warm the table so sections reference it (RIC > 0):
+            const warm = encoder.encodeFieldSection(1, [smallField]);
+            feedAll(warm.encoderStreamData);
+            await withTimeout(decoder.decodeFieldSection(1, warm.fieldSection));
+            encoder.processDecoderStreamData(decoder.takeDecoderStreamData());
+
+            // Oversized headers section then valid trailers, both stream 2:
+            const headers = encoder.encodeFieldSection(2, [
+                smallField, smallField, smallField, smallField
+            ]);
+            const trailers = encoder.encodeFieldSection(2, [smallField]);
+            feedAll(headers.encoderStreamData);
+            feedAll(trailers.encoderStreamData);
+
+            const headersError = await withTimeout(
+                decoder.decodeFieldSection(2, headers.fieldSection).then(
+                    () => { throw new Error('Decode should have failed'); },
+                    (e) => e
+                )
+            );
+            expect(headersError).to.be.an.instanceOf(FieldSectionTooLargeError);
+
+            // The stream is abandoned: the trailers cannot be decoded (an
+            // acknowledgment after our cancellation would be a connection
+            // error at the peer):
+            const trailersError = await withTimeout(
+                decoder.decodeFieldSection(2, trailers.fieldSection).then(
+                    () => { throw new Error('Decode should have failed'); },
+                    (e) => e
+                )
+            );
+            expect(trailersError).to.be.an.instanceOf(Error);
+            expect((trailersError as Error).message).to.match(/cancelled stream/);
+
+            // The proof: the real peer encoder accepts all our feedback
+            // (cancellation, no stray acknowledgments) without erroring:
+            encoder.processDecoderStreamData(decoder.takeDecoderStreamData());
+        });
+
+        it('emits a single cancellation for repeated cancelStream calls', () => {
+            const decoder = new QpackDecoder({
+                maxTableCapacity: 4096,
+                maxBlockedStreams: 100
+            });
+            decoder.cancelStream(4);
+            decoder.cancelStream(4);
+            expect(decoder.takeDecoderStreamData()).to.deep.equal(hex('44'));
+        });
+    });
+
+    describe('callback re-entrancy', () => {
+        // A single Insert With Literal Name instruction:
+        const insertInstruction = (name: string, value: string) => concatBytes([
+            encodeStringLiteral(name, 5, 0x40, false),
+            encodeStringLiteral(value, 7, 0, false)
+        ]);
+
+        it('emits consistent insert counts when the callback re-enters', () => {
+            const chunks: Uint8Array[] = [];
+            let reentered = false;
+            const decoder: QpackDecoder = new QpackDecoder({
+                maxTableCapacity: 4096,
+                maxBlockedStreams: 100,
+                onDecoderStreamData: (data) => {
+                    chunks.push(data);
+                    if (!reentered) {
+                        reentered = true;
+                        decoder.processEncoderStreamData(insertInstruction('b', '2'));
+                    }
+                }
+            });
+
+            decoder.processEncoderStreamData(hex('3fe11f')); // Set capacity
+            decoder.processEncoderStreamData(insertInstruction('a', '1'));
+
+            // Two insertions total, so the Insert Count Increments (00xxxxxx
+            // instructions) must sum to exactly 2:
+            const increments = chunks.flatMap((chunk) => [...chunk])
+                .filter((byte) => (byte & 0xc0) === 0x00);
+            expect(increments.reduce((sum, byte) => sum + byte, 0)).to.equal(2);
+        });
+
+        it('honours cancelStream called from an unblock acknowledgment', async () => {
+            const output: number[] = [];
+            const decoder: QpackDecoder = new QpackDecoder({
+                maxTableCapacity: 4096,
+                maxBlockedStreams: 100,
+                onDecoderStreamData: (data) => {
+                    output.push(...data);
+                    // When stream 4's section is acknowledged, the app
+                    // cancels stream 8 (e.g. a timeout fired):
+                    if (data.length === 1 && data[0] === 0x84) {
+                        decoder.cancelStream(8);
+                    }
+                }
+            });
+
+            // Stream 4 needs 1 insertion; stream 8 needs 2:
+            const four = decoder.decodeFieldSection(4, hex('0200 80'));
+            const eight = decoder.decodeFieldSection(8, hex('0300 80'));
+            eight.catch(() => {});
+
+            decoder.processEncoderStreamData(hex('3fe11f'));
+            decoder.processEncoderStreamData(insertInstruction('a', '1'));
+            expect(await withTimeout(four)).to.deep.equal([{ name: 'a', value: '1' }]);
+
+            // Stream 8 was cancelled from the callback; the second insertion
+            // must NOT resurrect it and ack it (0x88) after the cancellation:
+            decoder.processEncoderStreamData(insertInstruction('b', '2'));
+            await expectRejection(withTimeout(eight));
+            expect(output).to.include(0x48, 'cancellation for stream 8');
+            expect(output).to.not.include(0x88, 'no ack after cancellation');
         });
     });
 

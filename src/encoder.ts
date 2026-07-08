@@ -70,9 +70,9 @@ interface UnackedSection {
 type FieldLinePlan =
     | { kind: 'indexed-static', index: number }
     | { kind: 'indexed-dynamic', absoluteIndex: number }
-    | { kind: 'literal-static-name', index: number, value: string, never?: boolean }
-    | { kind: 'literal-dynamic-name', absoluteIndex: number, value: string }
-    | { kind: 'literal', name: string, value: string, never?: boolean };
+    | { kind: 'literal-static-name', index: number, value: string, never: boolean }
+    | { kind: 'literal-dynamic-name', absoluteIndex: number, value: string, never: boolean }
+    | { kind: 'literal', name: string, value: string, never: boolean };
 
 const NO_BYTES = new Uint8Array(0);
 
@@ -142,6 +142,11 @@ export class QpackEncoder {
         return Math.floor(this.maxTableCapacity / 32);
     }
 
+    /** The total number of dynamic table insertions made, as a diagnostic */
+    get dynamicTableInsertCount(): number {
+        return this.table.insertCount;
+    }
+
     /** The requested capacity, capped by what the peer currently allows */
     private get tableCapacityToUse(): number {
         return Math.min(
@@ -171,10 +176,15 @@ export class QpackEncoder {
                 );
             }
             // MaxEntries (from the peer's advertised capacity) defines the
-            // modulus for Required Insert Count encoding. Sections already
-            // sent used the old value; they only decode identically under
-            // the new one if no wrapped encodings exist yet:
-            if (this.table.insertCount >= 2 * this.maxEntries) {
+            // modulus for Required Insert Count encoding: our sent sections
+            // used the old value, while the peer decodes with the new one.
+            // They agree only while no encoding has wrapped either modulus,
+            // so the smaller of the two is the binding limit:
+            const limitingEntries = Math.min(
+                this.maxEntries,
+                Math.floor(newMaxCapacity / 32)
+            );
+            if (this.table.insertCount >= 2 * limitingEntries) {
                 throw new Error(
                     `Cannot adopt a changed max table capacity after ` +
                     `${this.table.insertCount} insertions: sent field sections ` +
@@ -212,13 +222,15 @@ export class QpackEncoder {
     encodeFieldSection(streamId: number, headers: HeaderField[]): EncodedFieldSection {
         // Enforced before any state changes, so a rejected section leaves
         // the encoder fully usable:
-        const sectionSize = headers.reduce((sum, field) => sum + entrySize(field), 0);
-        if (sectionSize > this.maxFieldSectionSize) {
-            throw new FieldSectionTooLargeError(
-                this.maxFieldSectionSize,
-                `Field section of size ${sectionSize} exceeds the peer's ` +
-                `advertised limit of ${this.maxFieldSectionSize}`
-            );
+        if (this.maxFieldSectionSize !== Infinity) {
+            const sectionSize = headers.reduce((sum, field) => sum + entrySize(field), 0);
+            if (sectionSize > this.maxFieldSectionSize) {
+                throw new FieldSectionTooLargeError(
+                    this.maxFieldSectionSize,
+                    `Field section of size ${sectionSize} exceeds the peer's ` +
+                    `advertised limit of ${this.maxFieldSectionSize}`
+                );
+            }
         }
 
         const encoderStream: Uint8Array[] = [];
@@ -291,7 +303,8 @@ export class QpackEncoder {
                     parts.push(encodeStringLiteral(plan.value, 7, 0, this.useHuffman));
                     break;
                 case 'literal-dynamic-name':
-                    parts.push(encodePrefixedInt(base - plan.absoluteIndex - 1, 4, 0x40));
+                    parts.push(encodePrefixedInt(
+                        base - plan.absoluteIndex - 1, 4, plan.never ? 0x60 : 0x40));
                     parts.push(encodeStringLiteral(plan.value, 7, 0, this.useHuffman));
                     break;
                 case 'literal':
@@ -333,32 +346,11 @@ export class QpackEncoder {
         pinned: Set<number>
     ): FieldLinePlan {
         const { name, value } = field;
-        const staticName = STATIC_NAME_MATCHES.get(name);
 
-        if (field.sensitive) {
-            // Sensitive fields are only ever sent as never-indexed literals
-            // (RFC 9204 s7.1): no table insertion, no value indexing (which
-            // would leak the value through the compressed size), and no
-            // recording in the insertion history. Name-only references are
-            // safe and standard:
+        const literalPlan = (never: boolean): FieldLinePlan => {
+            const staticName = STATIC_NAME_MATCHES.get(name);
             if (staticName !== undefined) {
-                return {
-                    kind: 'literal-static-name',
-                    index: staticName,
-                    value,
-                    never: true
-                };
-            }
-            return { kind: 'literal', name, value, never: true };
-        }
-
-        const staticExact = STATIC_EXACT_MATCHES.get(`${name}\0${value}`);
-        if (staticExact !== undefined) {
-            return { kind: 'indexed-static', index: staticExact };
-        }
-        const literalPlan = (): FieldLinePlan => {
-            if (staticName !== undefined) {
-                return { kind: 'literal-static-name', index: staticName, value };
+                return { kind: 'literal-static-name', index: staticName, value, never };
             }
             // A dynamic name reference also counts as a (potentially
             // blocking, eviction-pinning) reference to that entry:
@@ -367,12 +359,31 @@ export class QpackEncoder {
                 && (nameMatch < this.knownReceivedCount || canRisk)
             ) {
                 refer(nameMatch);
-                return { kind: 'literal-dynamic-name', absoluteIndex: nameMatch, value };
+                return {
+                    kind: 'literal-dynamic-name',
+                    absoluteIndex: nameMatch,
+                    value,
+                    never
+                };
             }
-            return { kind: 'literal', name, value };
+            return { kind: 'literal', name, value, never };
         };
 
-        if (this.lastSentCapacity === 0) return literalPlan();
+        if (field.sensitive) {
+            // Sensitive fields are only ever sent as never-indexed literals
+            // (RFC 9204 s7.1): no table insertion, no value indexing (which
+            // would leak the value through the compressed size), and no
+            // recording in the insertion history. Name-only references are
+            // safe and standard:
+            return literalPlan(true);
+        }
+
+        const staticExact = STATIC_EXACT_MATCHES.get(`${name}\0${value}`);
+        if (staticExact !== undefined) {
+            return { kind: 'indexed-static', index: staticExact };
+        }
+
+        if (this.lastSentCapacity === 0) return literalPlan(false);
 
         const fieldKey = `${name}\0${value}`;
         const exactMatch = this.liveIndex(this.tableByField, fieldKey);
@@ -409,6 +420,7 @@ export class QpackEncoder {
                     this.table.insertCount - exactMatch - 1, 5, 0x00
                 ));
             } else {
+                const staticName = STATIC_NAME_MATCHES.get(name);
                 const nameMatch = this.liveIndex(this.tableByName, name);
                 if (staticName !== undefined) {
                     // Insert with static name reference
@@ -440,7 +452,7 @@ export class QpackEncoder {
             }
         }
 
-        return literalPlan();
+        return literalPlan(false);
     }
 
     /** Looks up a tracked index, ignoring entries that have been evicted */

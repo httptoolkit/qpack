@@ -3,6 +3,7 @@
  * Huffman flag bit immediately above a length prefix, then that many bytes,
  * Huffman-coded if flagged.
  */
+import { FieldSectionTooLargeError } from './errors.js';
 import { huffmanEncode, huffmanDecode } from './huffman.js';
 import { encodePrefixedInt, decodePrefixedInt } from './prefixed-int.js';
 
@@ -76,23 +77,36 @@ export interface DecodedString {
 
 /**
  * Decodes a string literal starting at the given offset. Returns null if
- * the data is incomplete (more bytes are needed).
+ * the data is incomplete (more bytes are needed). If maxDecodedLength is
+ * given, a string that would decode past it fails with a
+ * FieldSectionTooLargeError before being materialized (raw strings from
+ * their declared length alone; Huffman strings by aborting mid-decode).
  */
 export function decodeStringLiteral(
     data: Uint8Array,
     offset: number,
-    prefixBits: number
+    prefixBits: number,
+    maxDecodedLength: number = Infinity
 ): DecodedString | null {
     if (offset >= data.length) return null;
     const isHuffman = (data[offset]! & (1 << prefixBits)) !== 0;
 
     const length = decodePrefixedInt(data, offset, prefixBits);
     if (length === null) return null;
+    if (!isHuffman && length.value > maxDecodedLength) {
+        throw new FieldSectionTooLargeError(
+            maxDecodedLength,
+            `String literal of length ${length.value} exceeds the remaining ` +
+            `field section budget`
+        );
+    }
     if (length.end + length.value > data.length) return null;
 
     const bytes = data.subarray(length.end, length.end + length.value);
     return {
-        value: bytesToString(isHuffman ? huffmanDecode(bytes) : bytes),
+        value: bytesToString(
+            isHuffman ? huffmanDecode(bytes, maxDecodedLength) : bytes
+        ),
         end: length.end + length.value
     };
 }

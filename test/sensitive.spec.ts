@@ -94,10 +94,12 @@ describe('sensitive fields', () => {
                 if (feedback.length > 0) encoder.processDecoderStreamData(feedback);
             }
 
-            const { fieldSection } = encoder.encodeFieldSection(3, [
+            const { fieldSection, encoderStreamData } = encoder.encodeFieldSection(3, [
                 { name: 'x-token', value: 'zzz', sensitive: true }
             ]);
-            expect(fieldSection[0]).to.equal(0, 'no dynamic table reference');
+            // No insertion, and the value comes back never-indexed (it may
+            // use a dynamic name reference - names are safe to reference):
+            expect(encoderStreamData.length).to.equal(0, 'no insertions');
             expect(await withTimeout(decoder.decodeFieldSection(3, fieldSection)))
                 .to.deep.equal([{ name: 'x-token', value: 'zzz', sensitive: true }]);
         });

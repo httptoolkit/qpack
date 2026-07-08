@@ -2,10 +2,12 @@
  * Huffman coding for field literals, using the code defined in RFC 7541
  * Appendix B (shared by HPACK and QPACK).
  */
-import { QpackError } from './errors.js';
+import { QpackError, FieldSectionTooLargeError } from './errors.js';
 import { HUFFMAN_CODES, HUFFMAN_BIT_LENGTHS } from './huffman-table.js';
 
 const EOS_SYMBOL = 256;
+/** The shortest Huffman code is 5 bits, so output <= input * 8/5 */
+const MAX_EXPANSION = 8 / 5;
 
 export function huffmanEncode(data: Uint8Array): Uint8Array {
     let totalBits = 0;
@@ -62,7 +64,19 @@ for (let symbol = 0; symbol <= EOS_SYMBOL; symbol++) {
     }
 }
 
-export function huffmanDecode(data: Uint8Array): Uint8Array {
+/**
+ * Decodes Huffman-coded data. If maxDecodedLength is given, decoding aborts
+ * with a FieldSectionTooLargeError as soon as the output would exceed it,
+ * bounding the work and memory spent on over-limit input.
+ */
+export function huffmanDecode(
+    data: Uint8Array,
+    maxDecodedLength: number = Infinity
+): Uint8Array {
+    // Skip the per-symbol limit checks entirely when the output can't
+    // possibly exceed the limit:
+    const checkLimit = maxDecodedLength < data.length * MAX_EXPANSION;
+
     const output: number[] = [];
 
     let node = DECODE_TREE;
@@ -81,6 +95,13 @@ export function huffmanDecode(data: Uint8Array): Uint8Array {
                     throw new QpackError(
                         'QPACK_DECOMPRESSION_FAILED',
                         'EOS symbol in Huffman-encoded data'
+                    );
+                }
+                if (checkLimit && output.length >= maxDecodedLength) {
+                    throw new FieldSectionTooLargeError(
+                        maxDecodedLength,
+                        'Huffman-coded string exceeds the remaining field ' +
+                        'section budget'
                     );
                 }
                 output.push(next);
