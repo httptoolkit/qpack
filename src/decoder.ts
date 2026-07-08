@@ -386,12 +386,14 @@ export class QpackDecoder {
             const firstByte = data[offset]!;
 
             if (firstByte & 0x80) {
-                // Indexed field line (T flag: static vs dynamic)
+                // Indexed field line (T flag: static vs dynamic).
+                // Copied, so callers mutating decoded headers can't corrupt
+                // the table entries:
                 const index = this.required(decodePrefixedInt(data, offset, 6));
-                headers.push((firstByte & 0x40)
+                const entry = (firstByte & 0x40)
                     ? this.staticEntry(index.value)
-                    : this.dynamicEntry(base - index.value - 1, requiredInsertCount)
-                );
+                    : this.dynamicEntry(base - index.value - 1, requiredInsertCount);
+                headers.push({ name: entry.name, value: entry.value });
                 offset = index.end;
             } else if (firstByte & 0x40) {
                 // Literal field line with name reference (N=0x20, T=0x10)
@@ -400,25 +402,32 @@ export class QpackDecoder {
                     ? this.staticEntry(index.value).name
                     : this.dynamicEntry(base - index.value - 1, requiredInsertCount).name;
                 const value = readString(index.end, 7);
-                headers.push({ name, value: value.value });
+                const header: HeaderField = { name, value: value.value };
+                if (firstByte & 0x20) header.sensitive = true;
+                headers.push(header);
                 offset = value.end;
             } else if (firstByte & 0x20) {
                 // Literal field line with literal name (N=0x10, H=0x08)
                 const name = readString(offset, 3);
                 const value = readString(name.end, 7);
-                headers.push({ name: name.value, value: value.value });
+                const header: HeaderField = { name: name.value, value: value.value };
+                if (firstByte & 0x10) header.sensitive = true;
+                headers.push(header);
                 offset = value.end;
             } else if (firstByte & 0x10) {
-                // Indexed field line with post-base index
+                // Indexed field line with post-base index (copied, as above)
                 const index = this.required(decodePrefixedInt(data, offset, 4));
-                headers.push(this.dynamicEntry(base + index.value, requiredInsertCount));
+                const entry = this.dynamicEntry(base + index.value, requiredInsertCount);
+                headers.push({ name: entry.name, value: entry.value });
                 offset = index.end;
             } else {
                 // Literal field line with post-base name reference (N=0x08)
                 const index = this.required(decodePrefixedInt(data, offset, 3));
                 const name = this.dynamicEntry(base + index.value, requiredInsertCount).name;
                 const value = readString(index.end, 7);
-                headers.push({ name, value: value.value });
+                const header: HeaderField = { name, value: value.value };
+                if (firstByte & 0x08) header.sensitive = true;
+                headers.push(header);
                 offset = value.end;
             }
 

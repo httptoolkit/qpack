@@ -70,9 +70,9 @@ interface UnackedSection {
 type FieldLinePlan =
     | { kind: 'indexed-static', index: number }
     | { kind: 'indexed-dynamic', absoluteIndex: number }
-    | { kind: 'literal-static-name', index: number, value: string }
+    | { kind: 'literal-static-name', index: number, value: string, never?: boolean }
     | { kind: 'literal-dynamic-name', absoluteIndex: number, value: string }
-    | { kind: 'literal', name: string, value: string };
+    | { kind: 'literal', name: string, value: string, never?: boolean };
 
 const NO_BYTES = new Uint8Array(0);
 
@@ -286,7 +286,8 @@ export class QpackEncoder {
                     parts.push(encodePrefixedInt(base - plan.absoluteIndex - 1, 6, 0x80));
                     break;
                 case 'literal-static-name':
-                    parts.push(encodePrefixedInt(plan.index, 4, 0x50));
+                    parts.push(encodePrefixedInt(
+                        plan.index, 4, plan.never ? 0x70 : 0x50));
                     parts.push(encodeStringLiteral(plan.value, 7, 0, this.useHuffman));
                     break;
                 case 'literal-dynamic-name':
@@ -294,7 +295,8 @@ export class QpackEncoder {
                     parts.push(encodeStringLiteral(plan.value, 7, 0, this.useHuffman));
                     break;
                 case 'literal':
-                    parts.push(encodeStringLiteral(plan.name, 3, 0x20, this.useHuffman));
+                    parts.push(encodeStringLiteral(
+                        plan.name, 3, plan.never ? 0x30 : 0x20, this.useHuffman));
                     parts.push(encodeStringLiteral(plan.value, 7, 0, this.useHuffman));
                     break;
             }
@@ -331,13 +333,29 @@ export class QpackEncoder {
         pinned: Set<number>
     ): FieldLinePlan {
         const { name, value } = field;
+        const staticName = STATIC_NAME_MATCHES.get(name);
+
+        if (field.sensitive) {
+            // Sensitive fields are only ever sent as never-indexed literals
+            // (RFC 9204 s7.1): no table insertion, no value indexing (which
+            // would leak the value through the compressed size), and no
+            // recording in the insertion history. Name-only references are
+            // safe and standard:
+            if (staticName !== undefined) {
+                return {
+                    kind: 'literal-static-name',
+                    index: staticName,
+                    value,
+                    never: true
+                };
+            }
+            return { kind: 'literal', name, value, never: true };
+        }
 
         const staticExact = STATIC_EXACT_MATCHES.get(`${name}\0${value}`);
         if (staticExact !== undefined) {
             return { kind: 'indexed-static', index: staticExact };
         }
-
-        const staticName = STATIC_NAME_MATCHES.get(name);
         const literalPlan = (): FieldLinePlan => {
             if (staticName !== undefined) {
                 return { kind: 'literal-static-name', index: staticName, value };
@@ -409,7 +427,9 @@ export class QpackEncoder {
                 }
             }
 
-            this.table.insert(field);
+            // Stored as a copy, so callers mutating their header objects
+            // after encoding can't corrupt the table:
+            this.table.insert({ name, value });
             const newIndex = this.table.insertCount - 1;
             this.tableByField.set(fieldKey, newIndex);
             this.tableByName.set(name, newIndex);
