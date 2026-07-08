@@ -1,0 +1,41 @@
+{
+  "name": "qpack",
+  "version": "0.0.0",
+  "description": "A pure-JS implementation of QPACK (RFC 9204) field compression for HTTP/3",
+  "homepage": "https://github.com/httptoolkit/qpack#readme",
+  "bugs": {
+    "url": "https://github.com/httptoolkit/qpack/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/httptoolkit/qpack.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Tim Perry <tim@httptoolkit.com>",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "setup-test-tools": "bash ./scripts/setup-test-tools.sh && npm run build-corpus-manifest",
+    "build-corpus-manifest": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm --no-warnings ./scripts/build-corpus-manifest.ts",
+    "test": "TS_NODE_TRANSPILE_ONLY=true mocha"
+  },
+  "ts-node": {
+    "esm": true,
+    "transpileOnly": true,
+    "project": "tsconfig.test.json"
+  },
+  "devDependencies": {
+    "@types/chai": "^5.2.3",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^25.3.3",
+    "chai": "^6.2.2",
+    "mocha": "^11.7.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

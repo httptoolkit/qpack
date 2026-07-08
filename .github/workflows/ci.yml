@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22.x, 24.x]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      # The third-party verification tools (the qifs corpus, and ls-qpack's
+      # reference encoder/decoder built from source). The setup script skips
+      # everything itself if the cached pins match.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            test/tools/qifs
+            test/tools/ls-qpack
+            test/tools/bin
+            test/tools/.pins
+          key: test-tools-${{ hashFiles('scripts/setup-test-tools.sh') }}
+
+      - run: npm run setup-test-tools
+
+      - run: npm run build
+
+      - run: npm test
